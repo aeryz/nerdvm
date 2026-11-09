@@ -12,7 +12,7 @@ use kvm_bindings::kvm_userspace_memory_region;
 fn main() {
     let mem_size = 0x4000;
     let guest_addr = 0x1000;
-    let asm_code = include_bytes!("guest").as_slice();
+    let asm_code = include_bytes!("../../result/guest").as_slice();
 
     // 1. Instantiate KVM.
     let kvm = Kvm::new().unwrap();

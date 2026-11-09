@@ -1,9 +1,5 @@
-[package]
-name = "nerdvm"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-kvm-bindings = "0.14.2"
-kvm-ioctls = "0.25"
-libc = "0.2.191"
+[workspace]
+resolver = "3"
+members = ["vmm", "guest"]
+# `guest` is bare-metal; build it with: cargo build -p guest --target x86_64-unknown-none
+default-members = ["vmm"]

@@ -20,7 +20,26 @@
         extensions = [ "rust-src" "rust-analyzer" ];
         targets = [ "x86_64-unknown-none" ];
       };
+      rustPlatform = pkgs.makeRustPlatform {
+        cargo = toolchain;
+        rustc = toolchain;
+      };
     in {
+      packages.${system}.build-guest = rustPlatform.buildRustPackage {
+        pname = "guest";
+        version = "0.1.0";
+        src = ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+        buildPhase = ''
+          cargo build --release --offline -p guest --target x86_64-unknown-none
+        '';
+        installPhase = ''
+          mkdir -p $out
+          cp target/x86_64-unknown-none/release/guest $out/guest
+        '';
+        doCheck = false;
+      };
+
       devShells.${system}.default = pkgs.mkShell {
         packages = [ toolchain ];
       };
