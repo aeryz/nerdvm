@@ -15,6 +15,10 @@ fn print(s: &[u8]) {
 extern "C" fn _start() -> ! {
     print(b"hello world!");
 
+    unsafe {
+        core::arch::asm!("hlt");
+    }
+
     loop {}
 }
 

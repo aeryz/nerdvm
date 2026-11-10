@@ -1,7 +1,11 @@
+use elf::ElfBytes;
+use elf::endian::AnyEndian;
 use kvm_bindings::KVM_XEN_ATTR_TYPE_LONG_MODE;
 use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
 
+use std::fs::File;
+use std::io::Read;
 use std::io::Write;
 use std::ptr::null_mut;
 use std::slice;
@@ -12,7 +16,16 @@ use kvm_bindings::kvm_userspace_memory_region;
 fn main() {
     let mem_size = 0x4000;
     let guest_addr = 0x1000;
+
+    let mut asm_code = Vec::new();
+    let _ = File::open("./result/guest")
+        .unwrap()
+        .read_to_end(&mut asm_code)
+        .unwrap();
     let asm_code = include_bytes!("../../result/guest").as_slice();
+
+    let elf_file = ElfBytes::<AnyEndian>::minimal_parse(asm_code).unwrap();
+    let header = elf_file.section_header_by_name(".text").unwrap().unwrap();
 
     // 1. Instantiate KVM.
     let kvm = Kvm::new().unwrap();
@@ -32,11 +45,10 @@ fn main() {
         ) as *mut u8
     };
 
-    let slot = 0;
     // When initializing the guest memory slot specify the
     // `KVM_MEM_LOG_DIRTY_PAGES` to enable the dirty log.
     let mem_region = kvm_userspace_memory_region {
-        slot,
+        slot: 0,
         guest_phys_addr: guest_addr,
         memory_size: mem_size as u64,
         userspace_addr: load_addr as u64,
@@ -44,10 +56,35 @@ fn main() {
     };
     unsafe { vm.set_user_memory_region(mem_region).unwrap() };
 
+    let userspace_ram_addr: *mut u8 = unsafe {
+        libc::mmap(
+            null_mut(),
+            0x1000,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
+            -1,
+            0,
+        ) as *mut u8
+    };
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 1,
+        flags: KVM_MEM_LOG_DIRTY_PAGES,
+        guest_phys_addr: 0x7000,
+        memory_size: 0x1000,
+        userspace_addr: userspace_ram_addr as u64,
+    };
+
+    unsafe { vm.set_user_memory_region(mem_region).unwrap() };
+
     // Write the code in the guest memory. This will generate a dirty page.
     unsafe {
         let mut slice = slice::from_raw_parts_mut(load_addr, mem_size);
-        slice.write(&asm_code).unwrap();
+        slice
+            .write(
+                &asm_code[header.sh_offset as usize..(header.sh_offset + header.sh_size) as usize],
+            )
+            .unwrap();
     }
 
     // 4. Create one vCPU.
@@ -124,6 +161,7 @@ fn main() {
 
     let mut regs = vcpu_fd.get_regs().unwrap();
     regs.rip = guest_addr;
+    regs.rsp = 0x7000;
     regs.rflags = 2;
     vcpu_fd.set_regs(&regs).unwrap();
 
@@ -135,21 +173,33 @@ fn main() {
             VcpuExit::IoIn(_, _) => {}
             VcpuExit::IoOut(addr, data) => {
                 if addr == 0x3f8 {
-                    // println!("raw data: {data:?}");
-                    print!("{}", String::from_utf8_lossy(data));
+                    print!("{}", data[0]);
                 }
             }
             VcpuExit::MmioRead(addr, mut out) => {
                 if addr == 0x8000 {
-                    out.write(device_0x8000.to_le_bytes().as_slice()).unwrap();
+                    panic!("cannot do that boss");
                 }
             }
             VcpuExit::MmioWrite(addr, data) => {
                 if addr == 0x8000 {
-                    device_0x8000 = u64::from_le_bytes(data.try_into().unwrap());
+                    print!("{}", data[0] as char);
+                    std::io::stdout().flush().unwrap();
                 }
             }
             VcpuExit::Hlt => {
+                println!("herere??");
+                break;
+            }
+            VcpuExit::InternalError => {
+                unsafe {
+                    eprintln!(
+                        "internal: {:?}",
+                        vcpu_fd.get_kvm_run().__bindgen_anon_1.internal
+                    );
+                }
+                eprintln!("regs: {:#x?}", vcpu_fd.get_regs().unwrap());
+                eprintln!("sregs: {:#x?}", vcpu_fd.get_sregs().unwrap());
                 break;
             }
             r => panic!("Unexpected exit reason: {:?}", r),
