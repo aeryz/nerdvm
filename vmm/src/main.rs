@@ -1,94 +1,87 @@
-use elf::ElfBytes;
-use elf::endian::AnyEndian;
-use kvm_bindings::KVM_XEN_ATTR_TYPE_LONG_MODE;
+use kvm_bindings::KVM_GUESTDBG_ENABLE;
+use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
 use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
+use linux_loader::bootparam::boot_params;
+use linux_loader::configurator::BootConfigurator;
+use linux_loader::configurator::BootParams;
+use linux_loader::configurator::linux::LinuxBootConfigurator;
+use linux_loader::loader::KernelLoader;
+use linux_loader::loader::KernelLoaderResult;
+use vm_memory::GuestAddress;
+use vm_memory::GuestMemoryBackend;
+use vm_memory::GuestRegionCollection;
+use vm_memory::GuestRegionMmap;
 
-use std::fs::File;
-use std::io::Read;
-use std::io::Write;
-use std::ptr::null_mut;
-use std::slice;
+use std::io::Cursor;
 
 use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
 use kvm_bindings::kvm_userspace_memory_region;
 
-fn main() {
-    let mem_size = 0x4000;
-    let guest_addr = 0x1000;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
 
-    let mut asm_code = Vec::new();
-    let _ = File::open("./result/guest")
-        .unwrap()
-        .read_to_end(&mut asm_code)
+const RAM_GUEST_ADDR: u64 = 0;
+const KERNEL_IMAGE_MEMSIZE: usize = 128 * 1024 * 1024;
+
+// Memory layout:
+// ----------
+// 0x1000: Boot params
+// 0x2000: Page table
+// 0x3000: Page table
+// 0x4000: Page table
+
+fn create_memory() -> (KernelLoaderResult, GuestRegionCollection<GuestRegionMmap>) {
+    let guest_memory =
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(RAM_GUEST_ADDR), KERNEL_IMAGE_MEMSIZE)])
+            .unwrap();
+    let mut kernel_image = vec![];
+    kernel_image.extend_from_slice(include_bytes!("../../vmlinuz-virt"));
+    let result = linux_loader::loader::BzImage::load(
+        &guest_memory,
+        None,
+        &mut Cursor::new(&kernel_image),
+        None,
+    )
+    .unwrap();
+
+    let mut params = boot_params::default();
+    let setup_header = result.setup_header.as_ref().unwrap().clone();
+    params.hdr = setup_header;
+
+    let boot_params = BootParams::new(&params, GuestAddress(0x1000));
+    LinuxBootConfigurator::write_bootparams::<GuestMemoryMmap>(&boot_params, &guest_memory)
         .unwrap();
-    let asm_code = include_bytes!("../../result/guest").as_slice();
 
-    let elf_file = ElfBytes::<AnyEndian>::minimal_parse(asm_code).unwrap();
-    let header = elf_file.section_header_by_name(".text").unwrap().unwrap();
+    (result, guest_memory)
+}
 
-    // 1. Instantiate KVM.
+fn main() {
+    let (kernel_loader_result, guest_memory) = create_memory();
+
     let kvm = Kvm::new().unwrap();
-
-    // 2. Create a VM.
     let vm = kvm.create_vm().unwrap();
 
-    // 3. Initialize Guest Memory.
-    let load_addr: *mut u8 = unsafe {
-        libc::mmap(
-            null_mut(),
-            mem_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
-            -1,
-            0,
-        ) as *mut u8
-    };
+    let host_memory = guest_memory
+        .get_host_address(GuestAddress(RAM_GUEST_ADDR))
+        .unwrap();
 
-    // When initializing the guest memory slot specify the
-    // `KVM_MEM_LOG_DIRTY_PAGES` to enable the dirty log.
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
-        guest_phys_addr: guest_addr,
-        memory_size: mem_size as u64,
-        userspace_addr: load_addr as u64,
         flags: KVM_MEM_LOG_DIRTY_PAGES,
+        guest_phys_addr: RAM_GUEST_ADDR,
+        memory_size: KERNEL_IMAGE_MEMSIZE as u64,
+        userspace_addr: host_memory as u64,
     };
-    unsafe { vm.set_user_memory_region(mem_region).unwrap() };
-
-    let userspace_ram_addr: *mut u8 = unsafe {
-        libc::mmap(
-            null_mut(),
-            0x1000,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
-            -1,
-            0,
-        ) as *mut u8
-    };
-
-    let mem_region = kvm_userspace_memory_region {
-        slot: 1,
-        flags: KVM_MEM_LOG_DIRTY_PAGES,
-        guest_phys_addr: 0x7000,
-        memory_size: 0x1000,
-        userspace_addr: userspace_ram_addr as u64,
-    };
-
-    unsafe { vm.set_user_memory_region(mem_region).unwrap() };
-
-    // Write the code in the guest memory. This will generate a dirty page.
     unsafe {
-        let mut slice = slice::from_raw_parts_mut(load_addr, mem_size);
-        slice
-            .write(
-                &asm_code[header.sh_offset as usize..(header.sh_offset + header.sh_size) as usize],
-            )
-            .unwrap();
+        vm.set_user_memory_region(mem_region).unwrap();
     }
 
     // 4. Create one vCPU.
     let mut vcpu_fd = vm.create_vcpu(0).unwrap();
+    let cpuid = kvm
+        .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .unwrap();
+    vcpu_fd.set_cpuid2(&cpuid).unwrap();
 
     const PML4: u64 = 0x2000;
     const PDPT: u64 = 0x3000;
@@ -99,15 +92,15 @@ fn main() {
     const HUGE_PAGE: u64 = 1 << 7;
 
     // Translate a guest physical address into an offset in our host allocation.
-    let ram = unsafe { std::slice::from_raw_parts_mut(load_addr, mem_size) };
+    let ram = unsafe { std::slice::from_raw_parts_mut(host_memory, KERNEL_IMAGE_MEMSIZE) };
 
     for gpa in [PML4, PDPT, PD] {
-        let offset = (gpa - guest_addr) as usize;
+        let offset = (gpa - RAM_GUEST_ADDR) as usize;
         ram[offset..offset + 4096].fill(0);
     }
 
     let mut write_entry = |table_gpa: u64, index: usize, value: u64| {
-        let offset = (table_gpa - guest_addr) as usize + index * 8;
+        let offset = (table_gpa - RAM_GUEST_ADDR) as usize + index * 8;
         ram[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     };
 
@@ -117,7 +110,10 @@ fn main() {
 
     // A page-directory entry with bit 7 set maps a 2 MiB page.
     // Physical base = 0, so virtual address == physical address.
-    write_entry(PD, 0, PRESENT | WRITABLE | HUGE_PAGE);
+    for i in 0..128 {
+        let physical_base = (i as u64) * 0x20_0000;
+        write_entry(PD, i, physical_base | PRESENT | WRITABLE | HUGE_PAGE);
+    }
 
     // 5. Initialize general purpose and special registers.
     // x86_64 specific registry setup.
@@ -160,35 +156,53 @@ fn main() {
     vcpu_fd.set_sregs(&sregs).unwrap();
 
     let mut regs = vcpu_fd.get_regs().unwrap();
-    regs.rip = guest_addr;
-    regs.rsp = 0x7000;
+    regs.rip = kernel_loader_result.kernel_load.0 + 0x200;
+    regs.rsp = 0;
+    regs.rsi = 0x1000;
     regs.rflags = 2;
     vcpu_fd.set_regs(&regs).unwrap();
 
-    let mut device_0x8000: u64 = 0;
+    let debug = kvm_bindings::kvm_guest_debug {
+        control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+        ..Default::default()
+    };
+
+    let mut continue_until = 0;
 
     // 6. Run code on the vCPU.
     loop {
+        vcpu_fd.set_guest_debug(&debug).unwrap();
         match vcpu_fd.run().expect("run failed") {
-            VcpuExit::IoIn(_, _) => {}
+            VcpuExit::IoIn(addr, _) => {
+                println!("io in addr: 0x{addr:?}");
+            }
             VcpuExit::IoOut(addr, data) => {
-                if addr == 0x3f8 {
-                    print!("{}", data[0]);
+                println!("io out addr: 0x{:?}, data: {:?}", addr, data);
+            }
+            VcpuExit::Debug(_) => {
+                let regs = vcpu_fd.get_regs().unwrap();
+                if continue_until == 0 || (continue_until != 0 && continue_until == regs.rip) {
+                    if continue_until != 0 {
+                        continue_until = 0;
+                    }
+                    println!("rip: 0x{:x}, 0x{:x}", regs.rip, regs.rbx);
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s).unwrap();
+                    if let Ok(addr) = u64::from_str_radix(&s.strip_suffix('\n').unwrap(), 16) {
+                        println!("waiting until rip = 0x{addr:x}");
+                        continue_until = addr;
+                    }
                 }
             }
             VcpuExit::MmioRead(addr, mut out) => {
-                if addr == 0x8000 {
-                    panic!("cannot do that boss");
-                }
+                let regs = vcpu_fd.get_regs().unwrap();
+                println!("mmio read happened at {addr}, {:x}", regs.rip);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                if addr == 0x8000 {
-                    print!("{}", data[0] as char);
-                    std::io::stdout().flush().unwrap();
-                }
+                println!("mmio write happened boss");
             }
             VcpuExit::Hlt => {
-                println!("herere??");
+                println!("halt??");
                 break;
             }
             VcpuExit::InternalError => {
