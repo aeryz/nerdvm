@@ -1,5 +1,5 @@
-use kvm_bindings::KVM_GUESTDBG_ENABLE;
-use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
+mod debugger;
+
 use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
 use linux_loader::bootparam::boot_params;
@@ -10,13 +10,13 @@ use linux_loader::loader::KernelLoader;
 use linux_loader::loader::KernelLoaderResult;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemoryBackend;
-use vm_memory::GuestRegionCollection;
-use vm_memory::GuestRegionMmap;
 
 use std::io::Cursor;
 
 use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
 use kvm_bindings::kvm_userspace_memory_region;
+
+use crate::debugger::Debugger;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
 
@@ -30,7 +30,7 @@ const KERNEL_IMAGE_MEMSIZE: usize = 128 * 1024 * 1024;
 // 0x3000: Page table
 // 0x4000: Page table
 
-fn create_memory() -> (KernelLoaderResult, GuestRegionCollection<GuestRegionMmap>) {
+fn create_memory() -> (KernelLoaderResult, GuestMemoryMmap) {
     let guest_memory =
         GuestMemoryMmap::from_ranges(&[(GuestAddress(RAM_GUEST_ADDR), KERNEL_IMAGE_MEMSIZE)])
             .unwrap();
@@ -162,16 +162,11 @@ fn main() {
     regs.rflags = 2;
     vcpu_fd.set_regs(&regs).unwrap();
 
-    let debug = kvm_bindings::kvm_guest_debug {
-        control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
-        ..Default::default()
-    };
-
-    let mut continue_until = 0;
+    let mut debugger = Debugger::initialize(&vcpu_fd).unwrap();
+    debugger.run(None, &vcpu_fd, &guest_memory).unwrap();
 
     // 6. Run code on the vCPU.
     loop {
-        vcpu_fd.set_guest_debug(&debug).unwrap();
         match vcpu_fd.run().expect("run failed") {
             VcpuExit::IoIn(addr, _) => {
                 println!("io in addr: 0x{addr:?}");
@@ -179,20 +174,8 @@ fn main() {
             VcpuExit::IoOut(addr, data) => {
                 println!("io out addr: 0x{:?}, data: {:?}", addr, data);
             }
-            VcpuExit::Debug(_) => {
-                let regs = vcpu_fd.get_regs().unwrap();
-                if continue_until == 0 || (continue_until != 0 && continue_until == regs.rip) {
-                    if continue_until != 0 {
-                        continue_until = 0;
-                    }
-                    println!("rip: 0x{:x}, 0x{:x}", regs.rip, regs.rbx);
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s).unwrap();
-                    if let Ok(addr) = u64::from_str_radix(&s.strip_suffix('\n').unwrap(), 16) {
-                        println!("waiting until rip = 0x{addr:x}");
-                        continue_until = addr;
-                    }
-                }
+            VcpuExit::Debug(exit) => {
+                debugger.run(Some(exit), &vcpu_fd, &guest_memory).unwrap();
             }
             VcpuExit::MmioRead(addr, mut out) => {
                 let regs = vcpu_fd.get_regs().unwrap();
