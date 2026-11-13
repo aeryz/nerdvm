@@ -1,12 +1,13 @@
 mod debugger;
+mod vmm;
 
+use gdbstub::stub::GdbStub;
+use gdbstub::stub::SingleThreadStopReason;
+use gdbstub::stub::run_blocking;
 use gdbstub::target::Target;
-use gdbstub::target::ext::base::BaseOps;
-use gdbstub::target::ext::base::singlethread::SingleThreadBase;
-use kvm_bindings::KVM_X86_SHADOW_INT_MOV_SS;
+use kvm_bindings::KVM_GUESTDBG_ENABLE;
+use kvm_bindings::KVM_GUESTDBG_USE_SW_BP;
 use kvm_ioctls::Kvm;
-use kvm_ioctls::VcpuExit;
-use kvm_ioctls::VcpuFd;
 use linux_loader::bootparam::boot_params;
 use linux_loader::configurator::BootConfigurator;
 use linux_loader::configurator::BootParams;
@@ -16,6 +17,7 @@ use linux_loader::loader::KernelLoaderResult;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemoryBackend;
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -23,7 +25,7 @@ use std::net::TcpStream;
 use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
 use kvm_bindings::kvm_userspace_memory_region;
 
-use crate::debugger::Debugger;
+use crate::vmm::Vm;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
 
@@ -37,79 +39,34 @@ const KERNEL_IMAGE_MEMSIZE: usize = 128 * 1024 * 1024;
 // 0x3000: Page table
 // 0x4000: Page table
 
-struct Vm {
-    vcpu_fd: VcpuFd,
-}
+enum MyGdbBlockingEventLoop {}
 
-impl Target for Vm {
-    type Arch = gdbstub_arch::x86::X86_64_SSE;
+impl run_blocking::BlockingEventLoop for MyGdbBlockingEventLoop {
+    type Target = vmm::Vm;
 
-    type Error = ();
+    type Connection = TcpStream;
 
-    fn base_ops(&mut self) -> BaseOps<'_, Self::Arch, Self::Error> {
-        BaseOps::SingleThread(self)
-    }
-}
+    type StopReason = SingleThreadStopReason<u64>;
 
-impl SingleThreadBase for Vm {
-    fn read_registers(
-        &mut self,
-        regs: &mut <Self::Arch as gdbstub::arch::Arch>::Registers,
-    ) -> gdbstub::target::TargetResult<(), Self> {
-        let registers = self.vcpu_fd.get_regs().unwrap();
-        // RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, r8-r15
-        regs.regs = [
-            registers.rax,
-            registers.rbx,
-            registers.rcx,
-            registers.rdx,
-            registers.rsi,
-            registers.rdi,
-            registers.rbp,
-            registers.rsp,
-            registers.r8,
-            registers.r9,
-            registers.r10,
-            registers.r11,
-            registers.r12,
-            registers.r13,
-            registers.r14,
-            registers.r15,
-        ];
-        regs.rip = registers.rip;
-        // XXX: is this the same thing??
-        regs.eflags = registers.rflags as u32;
-
-        let sregs = self.vcpu_fd.get_sregs().unwrap();
-        regs.segments.cs = sregs.cs.selector as u32;
-        regs.segments.ss = sregs.ss.selector as u32;
-        regs.segments.ds = sregs.ds.selector as u32;
-        regs.segments.fs = sregs.fs.selector as u32;
-        regs.segments.gs = sregs.gs.selector as u32;
-
-        Ok(())
+    fn wait_for_stop_reason(
+        target: &mut Self::Target,
+        conn: &mut Self::Connection,
+    ) -> Result<
+        run_blocking::Event<Self::StopReason>,
+        run_blocking::WaitForStopReasonError<
+            <Self::Target as Target>::Error,
+            <Self::Connection as gdbstub::conn::Connection>::Error,
+        >,
+    > {
+        loop {
+            let stop_reason = target.run();
+            return Ok(run_blocking::Event::TargetStopped(stop_reason));
+        }
     }
 
-    fn write_registers(
-        &mut self,
-        regs: &<Self::Arch as gdbstub::arch::Arch>::Registers,
-    ) -> gdbstub::target::TargetResult<(), Self> {
-        todo!()
-    }
-
-    fn read_addrs(
-        &mut self,
-        start_addr: <Self::Arch as gdbstub::arch::Arch>::Usize,
-        data: &mut [u8],
-    ) -> gdbstub::target::TargetResult<usize, Self> {
-        todo!()
-    }
-
-    fn write_addrs(
-        &mut self,
-        start_addr: <Self::Arch as gdbstub::arch::Arch>::Usize,
-        data: &[u8],
-    ) -> gdbstub::target::TargetResult<(), Self> {
+    fn on_interrupt(
+        target: &mut Self::Target,
+    ) -> Result<Option<Self::StopReason>, <Self::Target as Target>::Error> {
         todo!()
     }
 }
@@ -259,44 +216,27 @@ fn main() {
     regs.rflags = 2;
     vcpu_fd.set_regs(&regs).unwrap();
 
-    let mut debugger = Debugger::initialize(&vcpu_fd).unwrap();
-    debugger.run(None, &vcpu_fd, &guest_memory).unwrap();
+    // let mut debugger = Debugger::initialize(&vcpu_fd).unwrap();
+    // debugger.run(None, &vcpu_fd, &guest_memory).unwrap();
+
+    vcpu_fd
+        .set_guest_debug(&kvm_bindings::kvm_guest_debug {
+            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut vm = Vm {
+        vcpu_fd,
+        guest_memory,
+        breakpoints: HashMap::new(),
+        stepping: false,
+    };
+
+    let stub = GdbStub::<Vm, _>::new(wait_for_gdb_connection(8080).unwrap());
+
+    stub.run_blocking::<MyGdbBlockingEventLoop>(&mut vm)
+        .unwrap();
 
     // 6. Run code on the vCPU.
-    loop {
-        match vcpu_fd.run().expect("run failed") {
-            VcpuExit::IoIn(addr, _) => {
-                println!("io in addr: 0x{addr:?}");
-            }
-            VcpuExit::IoOut(addr, data) => {
-                println!("io out addr: 0x{:?}, data: {:?}", addr, data);
-            }
-            VcpuExit::Debug(exit) => {
-                debugger.run(Some(exit), &vcpu_fd, &guest_memory).unwrap();
-            }
-            VcpuExit::MmioRead(addr, mut out) => {
-                let regs = vcpu_fd.get_regs().unwrap();
-                println!("mmio read happened at {addr}, {:x}", regs.rip);
-            }
-            VcpuExit::MmioWrite(addr, data) => {
-                println!("mmio write happened boss");
-            }
-            VcpuExit::Hlt => {
-                println!("halt??");
-                break;
-            }
-            VcpuExit::InternalError => {
-                unsafe {
-                    eprintln!(
-                        "internal: {:?}",
-                        vcpu_fd.get_kvm_run().__bindgen_anon_1.internal
-                    );
-                }
-                eprintln!("regs: {:#x?}", vcpu_fd.get_regs().unwrap());
-                eprintln!("sregs: {:#x?}", vcpu_fd.get_sregs().unwrap());
-                break;
-            }
-            r => panic!("Unexpected exit reason: {:?}", r),
-        }
-    }
 }
