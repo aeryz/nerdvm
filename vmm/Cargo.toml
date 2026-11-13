@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 elf = "0.8.0"
+gdbstub = "0.7.10"
+gdbstub_arch = "0.3.3"
 kvm-bindings = "0.14.2"
 kvm-ioctls = "0.25"
 libc = "0.2.191"

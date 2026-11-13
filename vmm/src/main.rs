@@ -1,7 +1,12 @@
 mod debugger;
 
+use gdbstub::target::Target;
+use gdbstub::target::ext::base::BaseOps;
+use gdbstub::target::ext::base::singlethread::SingleThreadBase;
+use kvm_bindings::KVM_X86_SHADOW_INT_MOV_SS;
 use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
+use kvm_ioctls::VcpuFd;
 use linux_loader::bootparam::boot_params;
 use linux_loader::configurator::BootConfigurator;
 use linux_loader::configurator::BootParams;
@@ -12,6 +17,8 @@ use vm_memory::GuestAddress;
 use vm_memory::GuestMemoryBackend;
 
 use std::io::Cursor;
+use std::net::TcpListener;
+use std::net::TcpStream;
 
 use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
 use kvm_bindings::kvm_userspace_memory_region;
@@ -29,6 +36,96 @@ const KERNEL_IMAGE_MEMSIZE: usize = 128 * 1024 * 1024;
 // 0x2000: Page table
 // 0x3000: Page table
 // 0x4000: Page table
+
+struct Vm {
+    vcpu_fd: VcpuFd,
+}
+
+impl Target for Vm {
+    type Arch = gdbstub_arch::x86::X86_64_SSE;
+
+    type Error = ();
+
+    fn base_ops(&mut self) -> BaseOps<'_, Self::Arch, Self::Error> {
+        BaseOps::SingleThread(self)
+    }
+}
+
+impl SingleThreadBase for Vm {
+    fn read_registers(
+        &mut self,
+        regs: &mut <Self::Arch as gdbstub::arch::Arch>::Registers,
+    ) -> gdbstub::target::TargetResult<(), Self> {
+        let registers = self.vcpu_fd.get_regs().unwrap();
+        // RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, r8-r15
+        regs.regs = [
+            registers.rax,
+            registers.rbx,
+            registers.rcx,
+            registers.rdx,
+            registers.rsi,
+            registers.rdi,
+            registers.rbp,
+            registers.rsp,
+            registers.r8,
+            registers.r9,
+            registers.r10,
+            registers.r11,
+            registers.r12,
+            registers.r13,
+            registers.r14,
+            registers.r15,
+        ];
+        regs.rip = registers.rip;
+        // XXX: is this the same thing??
+        regs.eflags = registers.rflags as u32;
+
+        let sregs = self.vcpu_fd.get_sregs().unwrap();
+        regs.segments.cs = sregs.cs.selector as u32;
+        regs.segments.ss = sregs.ss.selector as u32;
+        regs.segments.ds = sregs.ds.selector as u32;
+        regs.segments.fs = sregs.fs.selector as u32;
+        regs.segments.gs = sregs.gs.selector as u32;
+
+        Ok(())
+    }
+
+    fn write_registers(
+        &mut self,
+        regs: &<Self::Arch as gdbstub::arch::Arch>::Registers,
+    ) -> gdbstub::target::TargetResult<(), Self> {
+        todo!()
+    }
+
+    fn read_addrs(
+        &mut self,
+        start_addr: <Self::Arch as gdbstub::arch::Arch>::Usize,
+        data: &mut [u8],
+    ) -> gdbstub::target::TargetResult<usize, Self> {
+        todo!()
+    }
+
+    fn write_addrs(
+        &mut self,
+        start_addr: <Self::Arch as gdbstub::arch::Arch>::Usize,
+        data: &[u8],
+    ) -> gdbstub::target::TargetResult<(), Self> {
+        todo!()
+    }
+}
+
+fn wait_for_gdb_connection(port: u16) -> anyhow::Result<TcpStream> {
+    let sockaddr = format!("localhost:{}", port);
+    eprintln!("Waiting for a GDB connection on {:?}...", sockaddr);
+    let sock = TcpListener::bind(sockaddr)?;
+    let (stream, addr) = sock.accept()?;
+
+    // Blocks until a GDB client connects via TCP.
+    // i.e: Running `target remote localhost:<port>` from the GDB prompt.
+
+    eprintln!("Debugger connected from {}", addr);
+    Ok(stream) // `TcpStream` implements `gdbstub::Connection`
+}
 
 fn create_memory() -> (KernelLoaderResult, GuestMemoryMmap) {
     let guest_memory =
